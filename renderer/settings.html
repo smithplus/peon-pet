@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline';">
+<title>Ajustes de Peon Pet</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f6f7; --card: #fff; --fg: #16161a; --muted: #6b6b76;
+    --line: rgba(0,0,0,.10); --accent: #3b7d4f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#1c1c1f; --card:#26262b; --fg:#ececf0; --muted:#9a9aa6;
+            --line: rgba(255,255,255,.12); --accent:#5fbf80; }
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font: 13px/1.45 -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
+    background: var(--bg); color: var(--fg); padding: 18px 20px 24px;
+  }
+  h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--muted); font-weight: 600; margin: 20px 0 8px;
+  }
+  h2:first-of-type { margin-top: 4px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 13px; border-bottom: 1px solid var(--line);
+  }
+  .row:last-child { border-bottom: 0; }
+  .row .label { flex: 1; min-width: 0; }
+  .row .label small { display: block; color: var(--muted); font-size: 11px; margin-top: 1px; }
+  select, input[type=range] { font: inherit; }
+  select {
+    background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 4px 8px; max-width: 190px;
+  }
+  input[type=range] { width: 130px; accent-color: var(--accent); }
+  input[type=checkbox] { width: 15px; height: 15px; accent-color: var(--accent); }
+  .val { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 42px; text-align: right; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 16px; padding: 11px 13px; }
+  .grid label { display: flex; align-items: center; gap: 7px; }
+  button {
+    font: inherit; background: var(--card); color: var(--fg); cursor: pointer;
+    border: 1px solid var(--line); border-radius: 6px; padding: 4px 11px;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  footer { margin-top: 18px; display: flex; justify-content: flex-end; }
+</style>
+</head>
+<body>
+
+<h2>Comportamiento</h2>
+<div class="card">
+  <div class="row">
+    <div class="label">Cuándo se muestra
+      <small id="mode-hint"></small>
+    </div>
+    <select id="mode">
+      <option value="follow">Seguir a Claude</option>
+      <option value="always">Siempre encendido</option>
+      <option value="off">Apagado</option>
+    </select>
+  </div>
+  <div class="row">
+    <div class="label">Iniciar al abrir sesión
+      <small>Carga el agente que vigila a Claude</small>
+    </div>
+    <input type="checkbox" id="startAtLogin">
+  </div>
+  <div class="row">
+    <div class="label">Frecuencia de detección
+      <small>Cada cuánto revisa si Claude está abierto</small>
+    </div>
+    <select id="interval">
+      <option value="5">5 s</option>
+      <option value="10">10 s</option>
+      <option value="30">30 s</option>
+      <option value="60">60 s</option>
+    </select>
+  </div>
+</div>
+
+<h2>Sonido</h2>
+<div class="card">
+  <div class="row">
+    <div class="label">Sonidos en pausa</div>
+    <input type="checkbox" id="paused">
+  </div>
+  <div class="row">
+    <div class="label">Voz</div>
+    <select id="pack"></select>
+  </div>
+  <div class="row">
+    <div class="label">Volumen</div>
+    <input type="range" id="volume" min="0" max="1" step="0.05">
+    <span class="val" id="volume-val"></span>
+  </div>
+  <div class="row">
+    <div class="label">Avisos de escritorio
+      <small>Los banners, además del sonido</small>
+    </div>
+    <input type="checkbox" id="desktopNotifications">
+  </div>
+  <div class="row">
+    <div class="label">Probar</div>
+    <button id="test">Reproducir «Terminé»</button>
+  </div>
+</div>
+
+<h2>Cuándo hablar</h2>
+<div class="card">
+  <div class="grid" id="cats"></div>
+</div>
+
+<h2>Apariencia</h2>
+<div class="card">
+  <div class="row">
+    <div class="label">Tamaño del orco
+      <small>También se arrastra desde las esquinas</small>
+    </div>
+    <input type="range" id="size" min="120" max="420" step="10">
+    <span class="val" id="size-val"></span>
+  </div>
+  <div class="row">
+    <div class="label">Mostrar el orco</div>
+    <input type="checkbox" id="petVisible">
+  </div>
+</div>
+
+<footer><button id="close">Cerrar</button></footer>
+
+<script>
+const CATS = [
+  ['task.complete', 'Terminé'],
+  ['input.required', 'Te necesito'],
+  ['task.error', 'Se rompió'],
+  ['resource.limit', 'Sin nafta'],
+  ['session.start', 'Al abrir sesión'],
+  ['task.acknowledge', 'Al arrancar tarea'],
+  ['user.spam', 'Si te apuro'],
+];
+const MODE_HINT = {
+  follow: 'Aparece con Claude y se cierra con Claude',
+  always: 'Se queda en pantalla aunque cierres Claude',
+  off:    'No se muestra hasta que lo vuelvas a encender',
+};
+const $ = (id) => document.getElementById(id);
+let state = null;
+
+function renderCats(categories) {
+  $('cats').innerHTML = '';
+  for (const [key, label] of CATS) {
+    const wrap = document.createElement('label');
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.checked = categories[key] === true;
+    box.addEventListener('change', () => push({ categories: { [key]: box.checked } }));
+    wrap.append(box, document.createTextNode(label));
+    $('cats').append(wrap);
+  }
+}
+
+async function push(patch) {
+  await window.settings.set(patch);
+  await load();
+}
+
+async function load() {
+  state = await window.settings.get();
+  $('mode').value = state.mode;
+  $('mode-hint').textContent = MODE_HINT[state.mode] || '';
+  $('startAtLogin').checked = state.startAtLogin;
+  $('interval').value = String(state.interval);
+  $('paused').checked = state.paused;
+  $('volume').value = state.volume;
+  $('volume-val').textContent = Math.round(state.volume * 100) + '%';
+  $('desktopNotifications').checked = state.desktopNotifications;
+  $('size').value = state.size;
+  $('size-val').textContent = state.size + 'px';
+  $('petVisible').checked = state.petVisible;
+
+  const sel = $('pack');
+  sel.innerHTML = '';
+  for (const p of state.packs) {
+    const o = document.createElement('option');
+    o.value = p.name; o.textContent = p.label;
+    if (p.name === state.pack) o.selected = true;
+    sel.append(o);
+  }
+  renderCats(state.categories);
+}
+
+$('mode').addEventListener('change', e => push({ mode: e.target.value }));
+$('startAtLogin').addEventListener('change', e => push({ startAtLogin: e.target.checked }));
+$('interval').addEventListener('change', e => push({ interval: Number(e.target.value) }));
+$('paused').addEventListener('change', e => push({ paused: e.target.checked }));
+$('pack').addEventListener('change', e => push({ pack: e.target.value }));
+$('desktopNotifications').addEventListener('change', e => push({ desktopNotifications: e.target.checked }));
+$('petVisible').addEventListener('change', e => push({ petVisible: e.target.checked }));
+$('test').addEventListener('click', () => window.settings.set({ preview: 'task.complete' }));
+$('close').addEventListener('click', () => window.settings.close());
+
+// Sliders apply live but only persist once the user lets go
+$('volume').addEventListener('input', e => { $('volume-val').textContent = Math.round(e.target.value * 100) + '%'; });
+$('volume').addEventListener('change', e => push({ volume: Number(e.target.value) }));
+$('size').addEventListener('input', e => {
+  $('size-val').textContent = e.target.value + 'px';
+  window.settings.set({ size: Number(e.target.value) });
+});
+
+load();
+</script>
+</body>
+</html>

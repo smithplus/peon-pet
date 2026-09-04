@@ -1,4 +1,7 @@
-const { app, BrowserWindow, screen, Menu, protocol, net, ipcMain } = require('electron');
+const { app, BrowserWindow, screen, Menu, Tray, nativeImage, protocol, net, ipcMain } = require('electron');
+const { buildControlMenu, setDisabledFlag } = require('./lib/control-menu');
+const petSettings = require('./lib/settings');
+const { WIN_SIZE, WIN_MARGIN, cornerPosition } = require('./lib/window-position');
 const path = require('path');
 const fs = require('fs');
 const {
@@ -52,6 +55,29 @@ function loadPetConfig() {
       path.join(app.getPath('userData'), 'peon-pet-config.json'), 'utf8'
     ));
   } catch { return {}; }
+}
+
+const MIN_PET_SIZE = 120;
+const MAX_PET_SIZE = 420;
+
+function savePetConfig(mutate) {
+  const cfg = loadPetConfig();
+  mutate(cfg);
+  try {
+    fs.writeFileSync(
+      path.join(app.getPath('userData'), 'peon-pet-config.json'),
+      JSON.stringify(cfg, null, 2) + '\n', 'utf8'
+    );
+  } catch { /* best effort */ }
+}
+
+function clampSize(n) {
+  return Math.max(MIN_PET_SIZE, Math.min(MAX_PET_SIZE, Math.round(n)));
+}
+
+function savedPetSize() {
+  const n = Number(loadPetConfig().size);
+  return Number.isFinite(n) ? clampSize(n) : null;
 }
 
 function registerCharacterProtocol() {
@@ -313,6 +339,72 @@ ipcMain.on('drag-stop', () => {
   isDragging = false;
 });
 
+// Corner resize: the grabbed corner follows the cursor and the opposite one
+// stays pinned, which is what makes a corner-docked widget feel right.
+let isResizing = false;
+let resizeAnchorX = 0;
+let resizeAnchorY = 0;
+let anchorIsLeft = true;
+let anchorIsTop = true;
+
+let resizeStartSize = WIN_SIZE;
+let signX = 1;
+let signY = 1;
+
+ipcMain.on('resize-start', (_e, corner) => {
+  if (!win || win.isDestroyed()) return;
+  const [wx, wy] = win.getPosition();
+  const [ww, wh] = win.getSize();
+  anchorIsLeft = corner === 'tr' || corner === 'br';   // grabbed right -> anchor left
+  anchorIsTop  = corner === 'bl' || corner === 'br';   // grabbed bottom -> anchor top
+  resizeAnchorX = anchorIsLeft ? wx : wx + ww;
+  resizeAnchorY = anchorIsTop  ? wy : wy + wh;
+  // Moving away from the anchor grows the window
+  signX = anchorIsLeft ? 1 : -1;
+  signY = anchorIsTop ? 1 : -1;
+  resizeStartSize = ww;
+  isResizing = true;
+  if (ignoringMouse) {
+    win.setIgnoreMouseEvents(false);
+    ignoringMouse = false;
+  }
+});
+
+// Deltas are CSS pixels from the renderer, the same unit as window bounds, so
+// no screen-coordinate conversion is needed.
+ipcMain.on('resize-move', (_e, { dx, dy }) => {
+  if (!isResizing || !win || win.isDestroyed()) return;
+  const size = clampSize(resizeStartSize + Math.max(dx * signX, dy * signY));
+  const nx = anchorIsLeft ? resizeAnchorX : resizeAnchorX - size;
+  const ny = anchorIsTop  ? resizeAnchorY : resizeAnchorY - size;
+  const [cw] = win.getSize();
+  const [px, py] = win.getPosition();
+  if (size === cw && nx === px && ny === py) return;
+  win.setBounds({ x: nx, y: ny, width: size, height: size });
+  win.webContents.send('pet-resize', { size });
+});
+
+ipcMain.on('resize-stop', () => {
+  if (!isResizing) return;
+  isResizing = false;
+  if (win && !win.isDestroyed()) {
+    const [w] = win.getSize();
+    savePetConfig(cfg => { cfg.size = clampSize(w); });
+    refreshMenus();
+  }
+});
+
+// Used by the tray menu presets; keeps the window anchored where it already is.
+function applyPetSize(size) {
+  if (!win || win.isDestroyed()) return;
+  const next = clampSize(size);
+  const [wx, wy] = win.getPosition();
+  win.setBounds({ x: wx, y: wy, width: next, height: next });
+  win.webContents.send('pet-resize', { size: next });
+  savePetConfig(cfg => { cfg.size = next; });
+  refreshMenus();
+}
+
 // Poll cursor position to enable mouse events only when hovering the window.
 // This lets the renderer receive mousemove for tooltips while keeping click-through.
 // During drag, moves the window to follow the cursor.
@@ -323,6 +415,9 @@ function startMouseTrackingForWindow(targetWin) {
       return;
     }
     const { x: cx, y: cy } = screen.getCursorScreenPoint();
+
+    // Resizing is driven by renderer pointermove, not by this poll
+    if (targetWin === win && isResizing) return;
 
     if (targetWin === win && isDragging) {
       const nx = cx - dragOffsetX;
@@ -346,47 +441,126 @@ function startMouseTrackingForWindow(targetWin) {
   }, 50);
 }
 
-function buildDockMenu() {
-  return Menu.buildFromTemplate([
-    {
-      label: petVisible ? 'Hide Pet' : 'Show Pet',
-      click() {
-        if (!win || win.isDestroyed()) return;
-        if (petVisible) {
-          win.hide();
-          for (const [, subWin] of subAgentWindows) {
-            if (!subWin.isDestroyed()) subWin.hide();
-          }
-        } else {
-          win.show();
-          for (const [, subWin] of subAgentWindows) {
-            if (!subWin.isDestroyed()) subWin.show();
-          }
-        }
-        petVisible = !petVisible;
-        app.dock.setMenu(buildDockMenu());
-      },
-    },
-    { type: 'separator' },
-    {
-      label: 'Quit',
-      click() {
-        app.quit();
-      },
-    },
-  ]);
+let tray = null;
+let trayIconPath = null;
+
+function togglePetVisibility() {
+  if (!win || win.isDestroyed()) return;
+  if (petVisible) {
+    win.hide();
+    for (const [, subWin] of subAgentWindows) {
+      if (!subWin.isDestroyed()) subWin.hide();
+    }
+  } else {
+    win.show();
+    for (const [, subWin] of subAgentWindows) {
+      if (!subWin.isDestroyed()) subWin.show();
+    }
+  }
+  petVisible = !petVisible;
+  refreshMenus();
 }
 
-const { WIN_SIZE, WIN_MARGIN, cornerPosition } = require('./lib/window-position');
+// "Salir" means off until re-enabled, otherwise the watch agent would just
+// bring the orc back within its next tick.
+function quitForGood() {
+  setDisabledFlag(true);          // legacy flag, still honoured by the watcher
+  petSettings.writeMode('off');
+  app.quit();
+}
+
+function buildDockMenu() {
+  const [w] = win && !win.isDestroyed() ? win.getSize() : [WIN_SIZE];
+  return buildControlMenu({
+    petVisible,
+    togglePet: togglePetVisibility,
+    refresh: refreshMenus,
+    quitApp: quitForGood,
+    petSize: w,
+    setPetSize: applyPetSize,
+    openSettings,
+  });
+}
+
+function refreshMenus() {
+  // A Menu instance is not shared between the dock and the tray on purpose:
+  // each surface owns its own, so state changes cannot cross-invalidate them.
+  if (process.platform === 'darwin' && app.dock) app.dock.setMenu(buildDockMenu());
+  if (tray && !tray.isDestroyed()) {
+    tray.setContextMenu(buildDockMenu());
+    tray.setToolTip('Peon Pet');
+  }
+}
+
+let settingsWin = null;
+
+function openSettings() {
+  if (settingsWin && !settingsWin.isDestroyed()) {
+    settingsWin.show();
+    settingsWin.focus();
+    return;
+  }
+  settingsWin = new BrowserWindow({
+    width: 460,
+    height: 660,
+    title: 'Ajustes de Peon Pet',
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'settings-preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  settingsWin.loadFile('renderer/settings.html');
+  settingsWin.webContents.on('console-message', (_e, lvl, msg) => console.log('[settings]', msg));
+  settingsWin.webContents.on('did-fail-load', (_e, code, desc) => console.log('[settings] FALLO', code, desc));
+  settingsWin.webContents.on('did-finish-load', () => console.log('[settings] cargada OK'));
+  settingsWin.once('ready-to-show', () => settingsWin.show());
+  settingsWin.on('closed', () => { settingsWin = null; });
+}
+
+ipcMain.handle('settings:get', () => {
+  const [w] = win && !win.isDestroyed() ? win.getSize() : [WIN_SIZE];
+  return petSettings.getState({ size: w, petVisible });
+});
+
+ipcMain.handle('settings:set', async (_e, patch) => {
+  await petSettings.applyPatch(patch, {
+    setPetSize: applyPetSize,
+    setPetVisible: (visible) => { if (visible !== petVisible) togglePetVisibility(); },
+  });
+  refreshMenus();
+});
+
+ipcMain.on('settings:close', () => {
+  if (settingsWin && !settingsWin.isDestroyed()) settingsWin.close();
+});
+
+function createTray(iconPath) {
+  if (tray) return;
+  trayIconPath = iconPath;
+  let img = nativeImage.createFromPath(iconPath);
+  if (!img.isEmpty()) img = img.resize({ width: 18, height: 18 });
+  tray = new Tray(img);
+  tray.setToolTip('Peon Pet');
+  refreshMenus();
+  console.log(`[peon-pet] tray listo (icono ${img.isEmpty() ? 'VACIO' : img.getSize().width + 'px'})`);
+}
+
 
 function createWindow() {
   const { width, height } = screen.getPrimaryDisplay().workAreaSize;
   const cfg = loadPetConfig();
   const { x, y } = cornerPosition(cfg.corner, width, height);
 
+  const petSize = savedPetSize() || WIN_SIZE;
+
   win = new BrowserWindow({
-    width: WIN_SIZE,
-    height: WIN_SIZE,
+    width: petSize,
+    height: petSize,
     x,
     y,
     transparent: true,
@@ -416,7 +590,8 @@ function createWindow() {
     const iconFile = charMap['dock-icon.png'] || BUNDLED_CHARS.orc['dock-icon.png'];
     const iconPath = fs.existsSync(customIcon) ? customIcon : path.join(assetsDir, iconFile);
     app.dock.setIcon(iconPath);
-    app.dock.setMenu(buildDockMenu());
+    createTray(iconPath);
+    refreshMenus();
   }
 
   if (process.argv.includes('--dev')) {
@@ -436,6 +611,8 @@ function createWindow() {
 
   // Start polling once window is ready
   win.webContents.once('did-finish-load', () => {
+    if (petSize !== WIN_SIZE) win.webContents.send('pet-resize', { size: petSize });
+    console.log(`[peon-pet] ventana ${petSize}px (guardado: ${savedPetSize() ?? 'ninguno'})`);
     startPolling();
     startMouseTrackingForWindow(win);
 
@@ -463,6 +640,8 @@ if (!gotLock) {
   app.quit();
 } else {
   app.whenReady().then(() => {
+    setDisabledFlag(false);
+    if (petSettings.readMode() === 'off') petSettings.writeMode('follow');
     registerCharacterProtocol();
     createWindow();
   });

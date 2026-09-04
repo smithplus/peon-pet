@@ -6,4 +6,8 @@ contextBridge.exposeInMainWorld('peonBridge', {
   startDrag: () => ipcRenderer.send('drag-start'),
   stopDrag: () => ipcRenderer.send('drag-stop'),
   onConfig: (callback) => ipcRenderer.on('peon-config', (_e, data) => callback(data)),
+  startResize: (corner) => ipcRenderer.send('resize-start', corner),
+  moveResize: (d) => ipcRenderer.send('resize-move', d),
+  stopResize: () => ipcRenderer.send('resize-stop'),
+  onResize: (callback) => ipcRenderer.on('pet-resize', (_e, data) => callback(data)),
 });

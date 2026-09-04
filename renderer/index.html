@@ -8,6 +8,32 @@
     * { margin: 0; padding: 0; }
     html, body { width: 200px; height: 200px; overflow: hidden; background: transparent; }
     canvas { display: block; }
+    /* Resize grips: corners only, invisible until the pointer is near them */
+    .grip {
+      position: absolute;
+      width: 20px; height: 20px;
+      z-index: 90;
+      opacity: 0;
+      transition: opacity 120ms ease;
+    }
+    .grip::after {
+      content: '';
+      position: absolute;
+      inset: 4px;
+      border-color: rgba(255, 255, 255, 0.75);
+      border-style: solid;
+      border-width: 0;
+    }
+    body:hover .grip { opacity: 0.55; }
+    .grip:hover { opacity: 1 !important; }
+    #grip-tl { top: 0; left: 0;  cursor: nwse-resize; }
+    #grip-tr { top: 0; right: 0; cursor: nesw-resize; }
+    #grip-bl { bottom: 0; left: 0;  cursor: nesw-resize; }
+    #grip-br { bottom: 0; right: 0; cursor: nwse-resize; }
+    #grip-tl::after { border-top-width: 2px; border-left-width: 2px; }
+    #grip-tr::after { border-top-width: 2px; border-right-width: 2px; }
+    #grip-bl::after { border-bottom-width: 2px; border-left-width: 2px; }
+    #grip-br::after { border-bottom-width: 2px; border-right-width: 2px; }
     #tooltip {
       position: absolute;
       display: none;
@@ -27,6 +53,10 @@
 </head>
 <body>
   <canvas id="c"></canvas>
+  <div class="grip" id="grip-tl"></div>
+  <div class="grip" id="grip-tr"></div>
+  <div class="grip" id="grip-bl"></div>
+  <div class="grip" id="grip-br"></div>
   <div id="tooltip"></div>
   <script type="module" src="app.js"></script>
 </body>

@@ -4,6 +4,11 @@ import * as THREE from '../node_modules/three/build/three.module.js';
 const ATLAS_COLS = 6;
 const ATLAS_ROWS = 6;
 
+// Set by anything that changes what is on screen; gates the actual draw call.
+// Declared up here because setFrame()/updateDots() touch it and can run during
+// scene setup, before the render-loop section is evaluated.
+let dirty = true;
+
 const ANIM_CONFIG = {
   sleeping:  { row: 0, frames: 6, fps: 3,  loop: true  },
   waking:    { row: 1, frames: 6, fps: 2,  loop: false, loops: 1 },
@@ -181,6 +186,7 @@ function updateDots(sessions) {
       u.visible.value = 0.0;
     }
   }
+  dirty = true;
 }
 
 function triggerFlash(r, g, b, intensity = 0.6, decay = 3.0) {
@@ -299,6 +305,7 @@ function setFrame(animName, frame) {
   uv.setXY(2, u0, v0); // BL
   uv.setXY(3, u1, v0); // BR
   uv.needsUpdate = true;
+  dirty = true;
 }
 
 function playAnim(animName) {
@@ -441,6 +448,7 @@ window.peonBridge.onConfig(({ size, subAgent }) => {
   sprite.geometry = geometry;
   borderMesh.geometry.dispose();
   borderMesh.geometry = new THREE.PlaneGeometry(size, size);
+  dirty = true;
 
   // Re-apply current frame UVs to the new geometry
   setFrame(currentAnim, currentFrame);
@@ -456,6 +464,55 @@ window.peonBridge.onConfig(({ size, subAgent }) => {
   tooltip.style.display = 'none';
   canvas.removeEventListener('mousemove', handleMouseMove);
   canvas.removeEventListener('mouseleave', handleMouseLeave);
+});
+
+// --- Corner resize grips ---
+// A live resize only needs a bigger canvas: the orthographic camera spans a
+// fixed 200-unit space, so the whole scene scales with it. That keeps the
+// session dots and the tooltip alive, unlike the sub-agent `peon-config` path
+// which disposes them.
+for (const corner of ['tl', 'tr', 'bl', 'br']) {
+  const grip = document.getElementById(`grip-${corner}`);
+  if (!grip) continue;
+  let originX = 0;
+  let originY = 0;
+  let resizing = false;
+
+  grip.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();          // must not reach the canvas, or it starts a move
+    tooltip.style.display = 'none';
+    grip.setPointerCapture(e.pointerId);
+    originX = e.screenX;
+    originY = e.screenY;
+    resizing = true;
+    window.peonBridge.startResize(corner);
+  });
+
+  // Driven by pointermove rather than the main process cursor poll: the poll
+  // runs at 50ms (20fps), which is what made dragging a corner feel steppy.
+  grip.addEventListener('pointermove', (e) => {
+    if (!resizing) return;
+    window.peonBridge.moveResize({ dx: e.screenX - originX, dy: e.screenY - originY });
+  });
+  const end = (e) => {
+    if (e.button !== undefined && e.button !== 0) return;
+    if (!resizing) return;
+    resizing = false;
+    window.peonBridge.stopResize();
+  };
+  grip.addEventListener('pointerup', end);
+  grip.addEventListener('lostpointercapture', end);
+}
+
+window.peonBridge.onResize(({ size }) => {
+  document.documentElement.style.width = `${size}px`;
+  document.documentElement.style.height = `${size}px`;
+  document.body.style.width = `${size}px`;
+  document.body.style.height = `${size}px`;
+  renderer.setSize(size, size);
+  dirty = true;
 });
 
 // --- IPC events ---
@@ -481,16 +538,41 @@ window.peonBridge.onSessionUpdate(({ sessions }) => {
 });
 
 // --- Render loop ---
+// Frame rate follows whatever is actually moving. The sprite never exceeds
+// 8fps (see ANIM_CONFIG) and the dot pulse has a ~2.1s period, so redrawing at
+// a flat 60fps burned CPU/GPU for frames nobody could see.
+function targetFps() {
+  // Transients need smooth motion
+  if (flashIntensity > 0 || particleLifetime > 0 || shakeIntensity > 0) return 30;
+  // Pulsing session dots
+  if (dotStates.some(d => d.active)) return 8;
+  // Just the sprite: match its own frame rate
+  return ANIM_CONFIG[currentAnim].fps;
+}
+
+function scheduleFrame() {
+  const fps = targetFps();
+  if (fps >= 30) {
+    requestAnimationFrame(animate);
+  } else {
+    // rAF inside the timeout so the loop still parks when the window is hidden
+    setTimeout(() => requestAnimationFrame(animate), 1000 / fps);
+  }
+}
+
 let lastTime = 0;
 function animate(time) {
-  requestAnimationFrame(animate);
-  const delta = Math.min((time - lastTime) / 1000, 0.1);
+  scheduleFrame();
+  // Cap must stay above the slowest tick (1/3s at sleeping fps) or the sprite
+  // and the decays would run in slow motion; it only exists to swallow stalls.
+  const delta = Math.min((time - lastTime) / 1000, 0.5);
   lastTime = time;
 
   // Animate dot pulse
   for (let i = 0; i < MAX_DOTS; i++) {
     if (dotStates[i].active) {
       dotMeshes[i].material.uniforms.pulse.value = (Math.sin(time * 0.003 + i) + 1) / 2;
+      dirty = true;
     } else {
       dotMeshes[i].material.uniforms.pulse.value = 0.0;
     }
@@ -500,6 +582,7 @@ function animate(time) {
   if (flashMesh && flashIntensity > 0) {
     flashIntensity = Math.max(0, flashIntensity - delta * flashDecay);
     flashMesh.material.uniforms.flashIntensity.value = flashIntensity;
+    dirty = true;
   }
 
   // Update particles
@@ -515,6 +598,7 @@ function animate(time) {
       v.vy += v.gravity * delta;
     }
     particleGeo.attributes.position.needsUpdate = true;
+    dirty = true;
 
     if (particleLifetime <= 0) {
       particles.visible = false;
@@ -559,11 +643,17 @@ function animate(time) {
     shakeIntensity = Math.max(0, shakeIntensity - SHAKE_DECAY * delta);
     sprite.position.x = (Math.random() - 0.5) * shakeIntensity;
     sprite.position.y = (Math.random() - 0.5) * shakeIntensity;
+    dirty = true;
   } else {
     sprite.position.x = 0;
     sprite.position.y = 0;
   }
 
-  renderer.render(scene, camera);
+  // Nothing moved since the last frame — the GPU would redraw an identical
+  // image, so skip it entirely.
+  if (dirty) {
+    renderer.render(scene, camera);
+    dirty = false;
+  }
 }
-requestAnimationFrame(animate);
+scheduleFrame();
