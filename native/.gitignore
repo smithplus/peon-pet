@@ -1,0 +1,3 @@
+build/
+# Derived at build time from the Electron app's assets by Tools/slice.swift
+Resources/
